@@ -1,0 +1,9 @@
+# 数据集路径
+train: D:\project\python\yolov5\data\mydata\datasets\images\train
+val: D:\project\python\yolov5\data\mydata\datasets\images\val
+
+# number of classes
+nc: 1
+
+# class names
+names: ["drone"]
