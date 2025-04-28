@@ -1,6 +1,8 @@
 # 数据集路径
-train: D:\project\python\yolov5\data\mydata\datasets\images\train
-val: D:\project\python\yolov5\data\mydata\datasets\images\val
+# 相对于 项目根目录 的路径
+train: data/mydata/drone_dataset_v3/train.txt 
+val: data/mydata/drone_dataset_v3/val.txt
+test: data/mydata/drone_dataset_v3/test.txt # 如果 test.txt 存在
 
 # number of classes
 nc: 1

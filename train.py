@@ -346,11 +346,11 @@ def train(hyp, opt, device, callbacks):
     # Start training
     t0 = time.time()
     nb = len(train_loader)  # number of batches
-    nw = max(round(hyp["warmup_epochs"] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
+    nw = max(round(hyp['warmup_epochs'] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
-    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    results = (0, 0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls, ext)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
@@ -376,7 +376,7 @@ def train(hyp, opt, device, callbacks):
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(3, device=device)  # mean losses
+        mloss = torch.zeros(4, device=device)  # mean losses [box, obj, cls, ext]
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
@@ -409,7 +409,7 @@ def train(hyp, opt, device, callbacks):
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
-            with torch.cuda.amp.autocast(amp):
+            with torch.amp.autocast('cuda', enabled=amp):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
@@ -436,7 +436,7 @@ def train(hyp, opt, device, callbacks):
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f"{torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
                 pbar.set_description(
-                    ("%11s" * 2 + "%11.4g" * 5)
+                    ("%11s" * 2 + "%11.4g" * 6)
                     % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
                 )
                 callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
@@ -499,17 +499,18 @@ def train(hyp, opt, device, callbacks):
                 del ckpt
                 callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
 
-        # EarlyStopping
-        if RANK != -1:  # if DDP training
-            broadcast_list = [stop if RANK == 0 else None]
-            dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
-            if RANK != 0:
-                stop = broadcast_list[0]
-        if stop:
-            break  # must break all DDP ranks
+            # EarlyStopping (Moved inside epoch loop)
+            if RANK != -1:  # if DDP training
+                broadcast_list = [stop if RANK == 0 else None]
+                dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
+                if RANK != 0:
+                    stop = broadcast_list[0]
+            if stop:
+                break  # must break all DDP ranks
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training -----------------------------------------------------------------------------------------------------
+    # This part executes after the loop finishes or breaks
     if RANK in {-1, 0}:
         LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
         for f in last, best:
@@ -565,8 +566,8 @@ def parse_opt(known=False):
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
-    parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
+    parser.add_argument("--cfg", type=str, default=ROOT / "models/yolov5s.yaml", help="model.yaml path")
+    parser.add_argument("--data", type=str, default=ROOT / "data/mydata.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
@@ -827,6 +828,7 @@ def main(opt, callbacks=Callbacks()):
                     "val/box_loss",
                     "val/obj_loss",
                     "val/cls_loss",
+                    "val/ext_loss",
                 )
                 print_mutation(keys, results, hyp.copy(), save_dir, opt.bucket)
                 fitness_scores.append(results[2])

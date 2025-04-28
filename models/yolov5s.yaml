@@ -4,6 +4,7 @@
 nc: 1 # number of classes
 depth_multiple: 0.33 # model depth multiple
 width_multiple: 0.50 # layer channel multiple
+num_extra_dims: 2 # <--- 在这里添加，值为你需要的额外维度数量 (例如 theta, phi)
 anchors:
   - [10, 13, 16, 30, 33, 23] # P3/8
   - [30, 61, 62, 45, 59, 119] # P4/16

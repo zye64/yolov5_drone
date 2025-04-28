@@ -54,15 +54,30 @@ class ComputeLoss:
         lbox = torch.zeros(1, device=self.device)
         lobj = torch.zeros(1, device=self.device)
         lseg = torch.zeros(1, device=self.device)
+        lext = torch.zeros(1, device=self.device)  # 额外维度损失
         tcls, tbox, indices, anchors, tidxs, xywhn = self.build_targets(p, targets)  # targets
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
-            tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
+            tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)
 
             if n := b.shape[0]:
-                pxy, pwh, _, pcls, pmask = pi[b, a, gj, gi].split((2, 2, 1, self.nc, nm), 1)  # subset of predictions
+                # 获取额外维度数量
+                num_extra_dims = pi.shape[2] - self.nc - self.nm - 5
+                
+                if num_extra_dims > 0:
+                    pxy, pwh, _, pcls, pextra, pmask = pi[b, a, gj, gi].split((2, 2, 1, self.nc, num_extra_dims, self.nm), 1)  # subset of predictions
+                    
+                    # 额外维度的MSE损失计算
+                    # 假设targets的最后num_extra_dims列为额外维度的目标值
+                    # 如果targets中没有对应的额外维度目标值，需要进行适当处理
+                    if targets.shape[1] > 6:  # 标准目标格式是[img_idx, cls, x, y, w, h]，因此大于6表示有额外维度
+                        text = targets[b.cpu(), 6:6+num_extra_dims].to(self.device)  # 获取额外维度目标值
+                        # 计算MSE损失
+                        lext += F.mse_loss(pextra.sigmoid(), text)
+                else:
+                    pxy, pwh, _, pcls, pmask = pi[b, a, gj, gi].split((2, 2, 1, self.nc, self.nm), 1)  # subset of predictions
 
                 # Box regression
                 pxy = pxy.sigmoid() * 2 - 0.5
@@ -110,9 +125,10 @@ class ComputeLoss:
         lobj *= self.hyp["obj"]
         lcls *= self.hyp["cls"]
         lseg *= self.hyp["box"] / bs
+        lext *= self.hyp.get("ext", 5.0)  # 使用超参数中的ext权重，如果没有则默认为1.0
 
-        loss = lbox + lobj + lcls + lseg
-        return loss * bs, torch.cat((lbox, lseg, lobj, lcls)).detach()
+        loss = lbox + lobj + lcls + lseg + lext
+        return loss * bs, torch.cat((lbox, lseg, lobj, lcls, lext)).detach()
 
     def single_mask_loss(self, gt_mask, pred, proto, xyxy, area):
         """Calculates and normalizes single mask loss for YOLOv5 between predicted and ground truth masks."""

@@ -76,11 +76,12 @@ class Detect(nn.Module):
     dynamic = False  # force grid reconstruction
     export = False  # export mode
 
-    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True, num_extra_dims=2):
         """Initializes YOLOv5 detection layer with specified classes, anchors, channels, and inplace operations."""
         super().__init__()
         self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
+        self.num_extra_dims = num_extra_dims  # 添加的额外维度数量
+        self.no = nc + 5 + num_extra_dims  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
         self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid
@@ -102,15 +103,27 @@ class Detect(nn.Module):
                     self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
                 if isinstance(self, Segment):  # (boxes + masks)
-                    xy, wh, conf, mask = x[i].split((2, 2, self.nc + 1, self.no - self.nc - 5), 4)
-                    xy = (xy.sigmoid() * 2 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (wh.sigmoid() * 2) ** 2 * self.anchor_grid[i]  # wh
-                    y = torch.cat((xy, wh, conf.sigmoid(), mask), 4)
+                    if self.num_extra_dims > 0:
+                        xy, wh, conf, extra_dims, mask = x[i].split((2, 2, self.nc + 1, self.num_extra_dims, self.no - self.nc - 5 - self.num_extra_dims), 4)
+                        xy = (xy.sigmoid() * 2 + self.grid[i]) * self.stride[i]  # xy
+                        wh = (wh.sigmoid() * 2) ** 2 * self.anchor_grid[i]  # wh
+                        y = torch.cat((xy, wh, conf.sigmoid(), extra_dims, mask), 4)
+                    else:
+                        xy, wh, conf, mask = x[i].split((2, 2, self.nc + 1, self.no - self.nc - 5), 4)
+                        xy = (xy.sigmoid() * 2 + self.grid[i]) * self.stride[i]  # xy
+                        wh = (wh.sigmoid() * 2) ** 2 * self.anchor_grid[i]  # wh
+                        y = torch.cat((xy, wh, conf.sigmoid(), mask), 4)
                 else:  # Detect (boxes only)
-                    xy, wh, conf = x[i].sigmoid().split((2, 2, self.nc + 1), 4)
-                    xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
-                    y = torch.cat((xy, wh, conf), 4)
+                    if self.num_extra_dims > 0:
+                        xy, wh, conf, extra_dims = x[i].sigmoid().split((2, 2, self.nc + 1, self.num_extra_dims), 4)
+                        xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
+                        wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
+                        y = torch.cat((xy, wh, conf, extra_dims), 4)
+                    else:
+                        xy, wh, conf = x[i].sigmoid().split((2, 2, self.nc + 1), 4)
+                        xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
+                        wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
+                        y = torch.cat((xy, wh, conf), 4)
                 z.append(y.view(bs, self.na * nx * ny, self.no))
 
         return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
@@ -130,12 +143,12 @@ class Detect(nn.Module):
 class Segment(Detect):
     """YOLOv5 Segment head for segmentation models, extending Detect with mask and prototype layers."""
 
-    def __init__(self, nc=80, anchors=(), nm=32, npr=256, ch=(), inplace=True):
+    def __init__(self, nc=80, anchors=(), nm=32, npr=256, ch=(), inplace=True, num_extra_dims=2):
         """Initializes YOLOv5 Segment head with options for mask count, protos, and channel adjustments."""
-        super().__init__(nc, anchors, ch, inplace)
+        super().__init__(nc, anchors, ch, inplace, num_extra_dims)
         self.nm = nm  # number of masks
         self.npr = npr  # number of protos
-        self.no = 5 + nc + self.nm  # number of outputs per anchor
+        self.no = 5 + nc + self.nm + num_extra_dims  # number of outputs per anchor
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
         self.proto = Proto(ch[0], self.npr, self.nm)  # protos
         self.detect = Detect.forward
@@ -392,6 +405,11 @@ def parse_model(d, ch):
         ch_mul = 8
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    
+    # 获取额外维度数量，默认为0
+    num_extra_dims = d.get("num_extra_dims", 0)
+    if num_extra_dims > 0:
+        LOGGER.info(f"{colorstr('extra dimensions:')} {num_extra_dims}")
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -440,6 +458,8 @@ def parse_model(d, ch):
                 args[1] = [list(range(args[1] * 2))] * len(f)
             if m is Segment:
                 args[3] = make_divisible(args[3] * gw, ch_mul)
+            # 添加额外维度参数
+            args.append(num_extra_dims)
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:

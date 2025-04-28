@@ -725,12 +725,7 @@ class LoadImagesAndLabels(Dataset):
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
         desc = f"{prefix}Scanning {path.parent / path.stem}..."
         with Pool(NUM_THREADS) as pool:
-            pbar = tqdm(
-                pool.imap(verify_image_label, zip(self.im_files, self.label_files, repeat(prefix))),
-                desc=desc,
-                total=len(self.im_files),
-                bar_format=TQDM_BAR_FORMAT,
-            )
+            pbar = tqdm(pool.imap(verify_image_label, zip(self.im_files, self.label_files, repeat(prefix))), desc=desc, total=len(self.im_files), bar_format=TQDM_BAR_FORMAT,)
             for im_file, lb, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
                 nm += nm_f
                 nf += nf_f
@@ -740,7 +735,7 @@ class LoadImagesAndLabels(Dataset):
                     x[im_file] = [lb, shape, segments]
                 if msg:
                     msgs.append(msg)
-                pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+                pbar.desc = f"{desc}{nf} found, {nm} missing, {ne} empty, {nc} corrupt"
 
         pbar.close()
         if msgs:
@@ -835,9 +830,15 @@ class LoadImagesAndLabels(Dataset):
             # labels = cutout(img, labels, p=0.5)
             # nl = len(labels)  # update after cutout
 
-        labels_out = torch.zeros((nl, 6))
+        labels_out = torch.zeros((nl, 8))  # [batch_idx, class, x, y, w, h, theta, phi]
         if nl:
-            labels_out[:, 1:] = torch.from_numpy(labels)
+            # 确保可以处理新的标签格式 (类别, x, y, w, h, theta, phi)
+            # 将class和传统bbox（x,y,w,h）复制到标准位置
+            labels_out[:, 1:6] = torch.from_numpy(labels[:, :5])
+            
+            # 复制theta和phi作为额外维度
+            if labels.shape[1] >= 7:  # 确保标签中有足够的维度
+                labels_out[:, 6:8] = torch.from_numpy(labels[:, 5:7])
 
         # Convert
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
@@ -1138,8 +1139,17 @@ def verify_image_label(args):
     im_file, lb_file, prefix = args
     nm, nf, ne, nc, msg, segments = 0, 0, 0, 0, "", []  # number (missing, found, empty, corrupt), message, segments
     try:
+        # === DEBUG PRINTS START ===
+        print(f"\n--- DEBUG: Verifying ---")
+        print(f"DEBUG: Image file: {im_file}")
+        print(f"DEBUG: Label file: {lb_file}")
+        # === DEBUG PRINTS END ===
+
         # verify images
         im = Image.open(im_file)
+        # === DEBUG PRINTS START ===
+        print(f"DEBUG: Image opened successfully.")
+        # === DEBUG PRINTS END ===
         im.verify()  # PIL verify
         shape = exif_size(im)  # image size
         assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
@@ -1153,32 +1163,84 @@ def verify_image_label(args):
 
         # verify labels
         if os.path.isfile(lb_file):
+            # === DEBUG PRINTS START ===
+            print(f"DEBUG: Label file FOUND: {lb_file}")
+            # === DEBUG PRINTS END ===
             nf = 1  # label found
             with open(lb_file) as f:
                 lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
-                if any(len(x) > 6 for x in lb):  # is segment
+
+                # --- 调整分割检测逻辑 --- 
+                # 仅当列数明确大于7时才认为是分割数据 (如果你的格式固定是7列)
+                # 或者，如果你不处理分割任务，可以直接注释掉这个if块
+                is_segment = False # 默认不是分割
+                if any(len(x) > 7 for x in lb): # 检查是否有行的列数 *大于* 7
+                    is_segment = True
+                    print(f"DEBUG: Detected potential segmentation data in {lb_file}")
+                    # --- 保留原始分割处理逻辑 (仅在 is_segment 为 True 时执行) ---
                     classes = np.array([x[0] for x in lb], dtype=np.float32)
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
-                lb = np.array(lb, dtype=np.float32)
+                    # --------------------------------------------------------------
+                
+                # 确保 lb 是 numpy 数组
+                # 如果不是分割且原始lb不为空，才进行转换；否则lb可能已被上面转换或应保持空
+                if not is_segment and lb:
+                    lb = np.array(lb, dtype=np.float32)
+                elif not lb: # 如果原始读取为空列表
+                     lb = np.zeros((0, 7), dtype=np.float32) # 保持空numpy数组，设为7列以匹配后续处理
+                 
             if nl := len(lb):
-                assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
-                assert (lb >= 0).all(), f"negative label values {lb[lb < 0]}"
-                assert (lb[:, 1:] <= 1).all(), f"non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}"
+                # 根据是否是分割数据，设置期望的列数
+                expected_columns = 5 if is_segment else 7
+
+                assert lb.shape[1] == expected_columns, f"labels require {expected_columns} columns, {lb.shape[1]} columns detected"
+                # === DEBUG PRINTS START ===
+                print(f"DEBUG: Label column count ({lb.shape[1]}) OK.")
+                # === DEBUG PRINTS END ===
+                
+                # 只对非分割数据检查坐标范围 (分割数据是 xyxy)
+                if not is_segment:
+                    assert (lb >= 0).all(), f"negative label values {lb[lb < 0]}"
+                    # === DEBUG PRINTS START ===
+                    print(f"DEBUG: Label non-negative values OK.")
+                    # === DEBUG PRINTS END ===
+                    # 坐标x,y,w,h需要归一化(0-1)
+                    assert (lb[:, 1:5] <= 1).all(), f"non-normalized or out of bounds coordinates {lb[:, 1:5][lb[:, 1:5] > 1]}"
+                    # === DEBUG PRINTS START ===
+                    print(f"DEBUG: Label coordinates normalized OK.")
+                    # === DEBUG PRINTS END ===
+                
                 _, i = np.unique(lb, axis=0, return_index=True)
                 if len(i) < nl:  # duplicate row check
                     lb = lb[i]  # remove duplicates
-                    if segments:
-                        segments = [segments[x] for x in i]
+                    if segments and not is_segment: # 只在非分割数据时处理段（如果需要的话）
+                        # Re-check segment handling if needed for detection format
+                        pass # segments = [segments[x] for x in i] # 可能需要调整
                     msg = f"{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed"
             else:
                 ne = 1  # label empty
-                lb = np.zeros((0, 5), dtype=np.float32)
+                # 确保lb是一个空的7列数组，即使文件本身为空或只有无效行
+                lb = np.zeros((0, 7), dtype=np.float32)
+                # === DEBUG PRINTS START ===
+                print(f"DEBUG: Label file is empty or contains no valid labels.")
+                # === DEBUG PRINTS END ===
         else:
+            # === DEBUG PRINTS START ===
+            print(f"DEBUG: Label file NOT FOUND: {lb_file}")
+            # === DEBUG PRINTS END ===
             nm = 1  # label missing
-            lb = np.zeros((0, 5), dtype=np.float32)
+            lb = np.zeros((0, 7), dtype=np.float32)  # 修改为7列
+        # === DEBUG PRINTS START ===
+        print(f"DEBUG: Verification successful for {im_file}")
+        print(f"--- DEBUG: End Verification ---")
+        # === DEBUG PRINTS END ===
         return im_file, lb, shape, segments, nm, nf, ne, nc, msg
     except Exception as e:
+        # === DEBUG PRINTS START ===
+        print(f"DEBUG: !!! Exception in verify_image_label for {im_file}: {e}")
+        print(f"--- DEBUG: End Verification (Exception) ---")
+        # === DEBUG PRINTS END ===
         nc = 1
         msg = f"{prefix}WARNING ⚠️ {im_file}: ignoring corrupt image/label: {e}"
         return [None, None, None, None, nm, nf, ne, nc, msg]

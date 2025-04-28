@@ -1017,6 +1017,7 @@ def non_max_suppression(
     labels=(),
     max_det=300,
     nm=0,  # number of masks
+    num_extra_dims=2,  # 额外维度的数量
 ):
     """
     Non-Maximum Suppression (NMS) on inference results to reject overlapping detections.
@@ -1035,7 +1036,7 @@ def non_max_suppression(
     if mps:  # MPS not fully supported yet, convert tensors to CPU before NMS
         prediction = prediction.cpu()
     bs = prediction.shape[0]  # batch size
-    nc = prediction.shape[2] - nm - 5  # number of classes
+    nc = prediction.shape[2] - nm - 5 - num_extra_dims  # number of classes
     xc = prediction[..., 4] > conf_thres  # candidates
 
     # Settings
@@ -1048,8 +1049,8 @@ def non_max_suppression(
     merge = False  # use merge-NMS
 
     t = time.time()
-    mi = 5 + nc  # mask start index
-    output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs
+    mi = 5 + nc + num_extra_dims  # mask start index
+    output = [torch.zeros((0, 6 + num_extra_dims + nm), device=prediction.device)] * bs
     for xi, x in enumerate(prediction):  # image index, image inference
         # Apply constraints
         # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
@@ -1058,7 +1059,7 @@ def non_max_suppression(
         # Cat apriori labels if autolabelling
         if labels and len(labels[xi]):
             lb = labels[xi]
-            v = torch.zeros((len(lb), nc + nm + 5), device=x.device)
+            v = torch.zeros((len(lb), nc + nm + 5 + num_extra_dims), device=x.device)
             v[:, :4] = lb[:, 1:5]  # box
             v[:, 4] = 1.0  # conf
             v[range(len(lb)), lb[:, 0].long() + 5] = 1.0  # cls
@@ -1078,10 +1079,15 @@ def non_max_suppression(
         # Detections matrix nx6 (xyxy, conf, cls)
         if multi_label:
             i, j = (x[:, 5:mi] > conf_thres).nonzero(as_tuple=False).T
-            x = torch.cat((box[i], x[i, 5 + j, None], j[:, None].float(), mask[i]), 1)
+            x = torch.cat((box[i], x[i, 5 + j, None], j[:, None].float(), x[i, mi-num_extra_dims:mi], mask[i]), 1)
         else:  # best class only
-            conf, j = x[:, 5:mi].max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
+            if num_extra_dims > 0:
+                conf, j = x[:, 5:mi-num_extra_dims].max(1, keepdim=True)
+                extra_dims = x[:, mi-num_extra_dims:mi]
+                x = torch.cat((box, conf, j.float(), extra_dims, mask), 1)[conf.view(-1) > conf_thres]
+            else:
+                conf, j = x[:, 5:mi].max(1, keepdim=True)
+                x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
 
         # Filter by class
         if classes is not None:

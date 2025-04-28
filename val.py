@@ -25,10 +25,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import csv
+import pandas as pd
+import matplotlib.pyplot as plt
 
 import numpy as np
 import torch
 from tqdm import tqdm
+import torch.nn as nn
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -87,9 +91,26 @@ def save_one_txt(predn, save_conf, shape, file):
         ```
     """
     gn = torch.tensor(shape)[[1, 0, 1, 0]]  # normalization gain whwh
-    for *xyxy, conf, cls in predn.tolist():
+    # 检查是否有额外维度 (theta, phi)
+    has_extra_dims = predn.shape[1] > 6
+    
+    # 修改解包逻辑以避免多个星号表达式错误
+    for p in predn.tolist():
+        xyxy = p[:4]
+        conf = p[4]
+        cls = p[5]
+        extra_dims = p[6:]
+        
         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+        
+        # 基础行格式
+        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)
+        
+        # 如果有额外维度(theta, phi)，添加到行末尾
+        if has_extra_dims and len(extra_dims) >= 2:
+            theta, phi = extra_dims[0], extra_dims[1]
+            line = (*line, theta, phi)
+        
         with open(file, "a") as f:
             f.write(("%g " * len(line)).rstrip() % line + "\n")
 
@@ -130,15 +151,26 @@ def save_one_json(predn, jdict, path, class_map):
     image_id = int(path.stem) if path.stem.isnumeric() else path.stem
     box = xyxy2xywh(predn[:, :4])  # xywh
     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
-    for p, b in zip(predn.tolist(), box.tolist()):
-        jdict.append(
-            {
-                "image_id": image_id,
-                "category_id": class_map[int(p[5])],
-                "bbox": [round(x, 3) for x in b],
-                "score": round(p[4], 5),
-            }
-        )
+    
+    # 检查是否有额外维度 (theta, phi)
+    has_extra_dims = predn.shape[1] > 6
+    
+    for i, (p, b) in enumerate(zip(predn.tolist(), box.tolist())):
+        result = {
+            "image_id": image_id,
+            "category_id": class_map[int(p[5])],
+            "bbox": [round(x, 3) for x in b],
+            "score": round(p[4], 5),
+        }
+        
+        # 如果有额外维度，添加到JSON中
+        if has_extra_dims and len(p) > 6:
+            # 取出theta和phi值
+            theta_phi = p[6:8]
+            result["theta"] = round(theta_phi[0], 5)
+            result["phi"] = round(theta_phi[1], 5)
+            
+        jdict.append(result)
 
 
 def process_batch(detections, labels, iouv):
@@ -182,6 +214,85 @@ def process_batch(detections, labels, iouv):
                 matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
             correct[matches[:, 1].astype(int), i] = True
     return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
+
+
+def plot_angle_errors(save_dir):
+    """Plots histograms and scatter plots from angle_errors.csv."""
+    csv_path = Path(save_dir) / 'angle_errors.csv'
+    if not csv_path.exists():
+        LOGGER.warning(f"CSV file not found at {csv_path}, skipping angle error plotting.")
+        return
+
+    try:
+        data = pd.read_csv(csv_path)
+        if data.empty:
+            LOGGER.warning(f"CSV file {csv_path} is empty, skipping angle error plotting.")
+            return
+
+        LOGGER.info(f"Plotting angle errors from {csv_path}...")
+
+        # Ensure error columns exist
+        if 'pitch_error_deg' not in data.columns or 'azimuth_error_deg' not in data.columns:
+             LOGGER.warning(f"CSV file {csv_path} missing required error columns, skipping plotting.")
+             return
+
+        # 1. Error Histograms
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.hist(data['pitch_error_deg'], bins=50)
+        plt.title('Pitch Error Distribution (degrees)')
+        plt.xlabel('Error (Predicted - Ground Truth)')
+        plt.ylabel('Frequency')
+        plt.grid(True, alpha=0.5)
+
+        plt.subplot(1, 2, 2)
+        plt.hist(data['azimuth_error_deg'], bins=50)
+        plt.title('Azimuth Error Distribution (degrees)')
+        plt.xlabel('Error (Predicted - Ground Truth)')
+        plt.grid(True, alpha=0.5)
+
+        hist_save_path = Path(save_dir) / 'angle_error_histograms.png'
+        plt.tight_layout()
+        plt.savefig(hist_save_path, dpi=200)
+        plt.close()
+        LOGGER.info(f"Saved error histograms to {hist_save_path}")
+
+        # 2. Predicted vs True Scatter Plots (Raw normalized values)
+        if 'pred_pitch_raw' in data.columns and 'gt_pitch_raw' in data.columns and \
+           'pred_azimuth_raw' in data.columns and 'gt_azimuth_raw' in data.columns:
+            plt.figure(figsize=(12, 5))
+            plt.subplot(1, 2, 1)
+            plt.scatter(data['gt_pitch_raw'], data['pred_pitch_raw'], alpha=0.5, s=5)
+            plt.plot([0, 1], [0, 1], 'r--', label='Ideal') # Add identity line
+            plt.title('Predicted vs True Pitch (Normalized)')
+            plt.xlabel('True Pitch (Normalized)')
+            plt.ylabel('Predicted Pitch (Normalized)')
+            plt.grid(True)
+            plt.legend()
+            plt.axis('square') # Make axes equal
+            plt.xlim(0, 1)
+            plt.ylim(0, 1)
+
+            plt.subplot(1, 2, 2)
+            plt.scatter(data['gt_azimuth_raw'], data['pred_azimuth_raw'], alpha=0.5, s=5)
+            plt.plot([0, 1], [0, 1], 'r--', label='Ideal') # Add identity line
+            plt.title('Predicted vs True Azimuth (Normalized)')
+            plt.xlabel('True Azimuth (Normalized)')
+            plt.ylabel('Predicted Azimuth (Normalized)')
+            plt.grid(True)
+            plt.legend()
+            plt.axis('square') # Make axes equal
+            plt.xlim(0, 1)
+            plt.ylim(0, 1)
+
+            scatter_save_path = Path(save_dir) / 'angle_pred_vs_true_scatter.png'
+            plt.tight_layout()
+            plt.savefig(scatter_save_path, dpi=200)
+            plt.close()
+            LOGGER.info(f"Saved prediction vs true scatter plots to {scatter_save_path}")
+
+    except Exception as e:
+        LOGGER.error(f"Failed to plot angle errors: {e}")
 
 
 @smart_inference_mode()
@@ -322,12 +433,17 @@ def run(
     s = ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "P", "R", "mAP50", "mAP50-95")
     tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     dt = Profile(device=device), Profile(device=device), Profile(device=device)  # profiling times
-    loss = torch.zeros(3, device=device)
+    loss = torch.zeros(4, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
+
+    # <<< Initialize list for storing detailed angle error data >>>
+    angle_error_data = []
+    # <<< End Initialization >>>
+
     callbacks.run("on_val_start")
-    pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
+    pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
-        callbacks.run("on_val_batch_start")
+        callbacks.run('on_val_batch_start')
         with dt[0]:
             if cuda:
                 im = im.to(device, non_blocking=True)
@@ -342,23 +458,90 @@ def run(
 
         # Loss
         if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+            loss += compute_loss(train_out, targets)[1]  # box, obj, cls, ext
 
         # NMS
-        targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+        targets[:, 2:6] *= torch.tensor((width, height, width, height), device=device)  # to pixels, only scale x,y,w,h
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         with dt[2]:
+            # --- Determine num_extra_dims (Handles standalone val.py and calls from train.py) ---
+            num_extra_dims = 0 # Default to 0
+            final_layer = None
+            model_description = f"type {type(model)}" # For logging
+
+            try:
+                # Case 1: Called standalone (model is DetectMultiBackend)
+                if isinstance(model, DetectMultiBackend):
+                    model_description = "DetectMultiBackend instance"
+                    if hasattr(model, 'pt') and model.pt and hasattr(model, 'model'):
+                        inner_model = model.model # This should be the DetectionModel instance
+                        if hasattr(inner_model, 'model') and isinstance(inner_model.model, nn.Sequential) and len(inner_model.model) > 0:
+                            final_layer = inner_model.model[-1]
+                        else:
+                            LOGGER.warning(f"WARNING ({model_description}): Could not access the expected internal sequential model structure (model.model).")
+                    else:
+                         LOGGER.warning(f"WARNING ({model_description}): Loaded model is not PyTorch or structure is unexpected.")
+
+                # Case 2: Called from train.py (model is likely DetectionModel or similar nn.Module)
+                elif isinstance(model, nn.Module):
+                     model_description = f"nn.Module instance ({type(model).__name__})"
+                     # Check if it has the expected structure directly (DetectionModel has model.model)
+                     if hasattr(model, 'model') and isinstance(model.model, nn.Sequential) and len(model.model) > 0:
+                         final_layer = model.model[-1]
+                     # Check if it's *already* the sequential model (less common, but possible)
+                     elif isinstance(model, nn.Sequential) and len(model) > 0:
+                         final_layer = model[-1]
+                     # Fallback: Maybe the num_extra_dims is directly on the model? (Unlikely for standard YOLOv5 structure)
+                     elif hasattr(model, 'num_extra_dims'):
+                         num_extra_dims = model.num_extra_dims
+                         final_layer = None # Prevent further checks below if found here
+                         LOGGER.info(f"Found num_extra_dims directly on model instance ({type(model).__name__}).")
+                     else:
+                         LOGGER.warning(f"WARNING ({model_description}): Could not access the expected internal sequential model structure (e.g., model.model).")
+                else:
+                    # Fallback for unexpected types
+                    LOGGER.warning(f"WARNING: Unexpected model type ({type(model)}). Cannot determine num_extra_dims reliably.")
+
+
+                # If we found a potential final layer, check for the attribute
+                if final_layer is not None:
+                    if hasattr(final_layer, 'num_extra_dims'):
+                        num_extra_dims = final_layer.num_extra_dims
+                    else:
+                        LOGGER.warning(f"WARNING ({model_description}): Final layer ({type(final_layer).__name__}) does not have 'num_extra_dims' attribute.")
+
+            except Exception as e:
+                LOGGER.error(f"ERROR ({model_description}): An unexpected error occurred while trying to determine num_extra_dims: {e}.")
+
+            # Log the final determined value before NMS
+            if num_extra_dims == 0:
+                 LOGGER.warning(f"Using num_extra_dims = 0 for Non-Max Suppression. Angle calculations will likely fail or be skipped.")
+            else:
+                 LOGGER.info(f"Using num_extra_dims = {num_extra_dims} for Non-Max Suppression.")
+            # --- End Determine num_extra_dims ---
+
             preds = non_max_suppression(
-                preds, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, max_det=max_det
+                preds, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, max_det=max_det,
+                num_extra_dims=num_extra_dims
             )
 
         # Metrics
         for si, pred in enumerate(preds):
-            labels = targets[targets[:, 0] == si, 1:]
+            labels = targets[targets[:, 0] == si, 1:] # Get labels for current image, format: [cls, x, y, w, h, pitch, azimuth]
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
             path, shape = Path(paths[si]), shapes[si][0]
             correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
             seen += 1
+
+            # <<< Add check for extra dims in labels and predictions >>>
+            # Prediction should have at least 8 columns: xyxy(4), conf(1), cls(1), pitch(1), azimuth(1)
+            has_extra_dims_pred = num_extra_dims >= 2 and pred.shape[1] >= 8
+            # Labels should have at least 8 columns: cls(1), xywh(4), pitch(1), azimuth(1)
+            has_extra_dims_label = labels.shape[1] >= 7 # cls,x,y,w,h,pitch,azimuth (index 6 is pitch)
+            can_calc_angle_error = has_extra_dims_pred and has_extra_dims_label
+            # Temporarily disable warning spam if dims are missing, but keep the check
+            # if not can_calc_angle_error and nl > 0 and npr > 0:
+            #      LOGGER.warning(f"Skipping angle error calculation for {path.name}: Predictions ({pred.shape[1]} cols) or labels ({labels.shape[1]} cols) lack required dimensions.")
 
             if npr == 0:
                 if nl:
@@ -375,12 +558,65 @@ def run(
 
             # Evaluate
             if nl:
-                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes (x,y,w,h are indices 1,2,3,4)
                 scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
+                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels with class
                 correct = process_batch(predn, labelsn, iouv)
                 if plots:
                     confusion_matrix.process_batch(predn, labelsn)
+
+                # <<< Angle Error Calculation Start >>>
+                if can_calc_angle_error:
+                    iou = box_iou(labelsn[:, 1:], predn[:, :4]) # IoU between native-space labels and preds
+                    # Create class mask for matching predictions and labels
+                    correct_class_mask = labels[:, 0:1] == pred[:, 5] # Compare GT class (idx 0) with Pred class (idx 5)
+                    iou_threshold = 0.5 # Minimum IoU for a match
+                    matched_preds_indices = set()
+                    
+                    # Iterate through each ground truth label
+                    for l_idx in range(nl):
+                        # Find predictions of the same class with IoU >= threshold
+                        matches = torch.where((iou[l_idx, :] >= iou_threshold) & (pred[:, 5] == labels[l_idx, 0]))[0]
+                        
+                        if len(matches) > 0:
+                            # If multiple preds match, pick the one with highest IoU
+                            best_match_local_idx = torch.argmax(iou[l_idx, matches])
+                            p_idx = matches[best_match_local_idx].item() # Get the index in the original pred tensor
+                            
+                            # Ensure this prediction hasn't been matched to another label
+                            if p_idx not in matched_preds_indices:
+                                matched_preds_indices.add(p_idx)
+                                
+                                # Extract angles (pitch at index 6, azimuth at index 7)
+                                p_pitch_raw = pred[p_idx, 6].item()
+                                p_azimuth_raw = pred[p_idx, 7].item()
+                                l_pitch_raw = labels[l_idx, 5].item() # Pitch is at index 5 in labels (cls,x,y,w,h,pitch,azi)
+                                l_azimuth_raw = labels[l_idx, 6].item()# Azimuth is at index 6 in labels
+
+                                # Calculate and store raw absolute error
+                                pitch_err_raw = p_pitch_raw - l_pitch_raw
+                                azimuth_err_raw = p_azimuth_raw - l_azimuth_raw
+                                pitch_err_deg = (p_pitch_raw * 180) - (l_pitch_raw * 180)
+                                azimuth_err_deg = (p_azimuth_raw * 360) - (l_azimuth_raw * 360)
+
+                                # Create match data dictionary
+                                match_data = {
+                                    "image_path": path.name,
+                                    "pred_box_x1": predn[p_idx, 0].item(), "pred_box_y1": predn[p_idx, 1].item(),
+                                    "pred_box_x2": predn[p_idx, 2].item(), "pred_box_y2": predn[p_idx, 3].item(),
+                                    "pred_conf": pred[p_idx, 4].item(), "pred_cls": int(pred[p_idx, 5].item()),
+                                    "pred_pitch_raw": p_pitch_raw, "pred_azimuth_raw": p_azimuth_raw,
+                                    "gt_box_x1": labelsn[l_idx, 1].item(), "gt_box_y1": labelsn[l_idx, 2].item(),
+                                    "gt_box_x2": labelsn[l_idx, 3].item(), "gt_box_y2": labelsn[l_idx, 4].item(),
+                                    "gt_cls": int(labels[l_idx, 0].item()),
+                                    "gt_pitch_raw": l_pitch_raw, "gt_azimuth_raw": l_azimuth_raw,
+                                    "iou": iou[l_idx, p_idx].item(),
+                                    "pitch_error_raw": pitch_err_raw, "azimuth_error_raw": azimuth_err_raw,
+                                    "pitch_error_deg": pitch_err_deg, "azimuth_error_deg": azimuth_err_deg,
+                                }
+                                angle_error_data.append(match_data)
+                # <<< Angle Error Calculation End >>>
+
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
 
             # Save/log
@@ -456,6 +692,42 @@ def run(
         except Exception as e:
             LOGGER.info(f"pycocotools unable to run: {e}")
 
+    # <<< Write Angle Error Data to CSV >>>
+    if angle_error_data:
+        csv_path = save_dir / 'angle_errors.csv'
+        LOGGER.info(f"Saving angle error data to {csv_path}...")
+        try:
+            fieldnames = [
+                "image_path", "pred_box_x1", "pred_box_y1", "pred_box_x2", "pred_box_y2",
+                "pred_conf", "pred_cls", "pred_pitch_raw", "pred_azimuth_raw",
+                "gt_box_x1", "gt_box_y1", "gt_box_x2", "gt_box_y2", "gt_cls",
+                "gt_pitch_raw", "gt_azimuth_raw", "iou",
+                "pitch_error_raw", "azimuth_error_raw",
+                "pitch_error_deg", "azimuth_error_deg"
+            ]
+            with open(csv_path, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(angle_error_data)
+
+            # Calculate and Print MAE from the collected data
+            all_pitch_err_deg = [abs(d['pitch_error_deg']) for d in angle_error_data]
+            all_azimuth_err_deg = [abs(d['azimuth_error_deg']) for d in angle_error_data]
+            mae_pitch_deg = np.mean(all_pitch_err_deg) if all_pitch_err_deg else 0
+            mae_azimuth_deg = np.mean(all_azimuth_err_deg) if all_azimuth_err_deg else 0
+            LOGGER.info(f"Pitch MAE (deg): {mae_pitch_deg:.2f}, Azimuth MAE (deg): {mae_azimuth_deg:.2f}")
+
+            # <<< Call plotting function after saving CSV >>>
+            if plots: # Only plot if plots are enabled
+                plot_angle_errors(save_dir)
+            # <<< End plotting call >>>
+
+        except Exception as e:
+            LOGGER.error(f"Failed to write angle errors to CSV: {e}")
+    else:
+        LOGGER.info("No matched predictions found with extra dimensions to calculate pitch/azimuth errors or save to CSV.")
+    # <<< End Write CSV >>>
+
     # Return results
     model.float()  # for training
     if not training:
@@ -464,7 +736,10 @@ def run(
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    final_loss = (loss.cpu() / len(dataloader)).tolist()
+    # Note: Returning MAE values here might require adjusting downstream code (e.g., train.py)
+    # For now, just printing MAE. Modify return statement if needed.
+    return (mp, mr, map50, map, *final_loss), maps, t
 
 
 def parse_opt():
@@ -515,7 +790,7 @@ def parse_opt():
         Additional options include saving results in different formats, selecting devices, and more.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
+    parser.add_argument("--data", type=str, default=ROOT / "data/mydata.yaml", help="dataset.yaml path")
     parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5s.pt", help="model path(s)")
     parser.add_argument("--batch-size", type=int, default=32, help="batch size")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="inference size (pixels)")

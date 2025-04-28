@@ -36,6 +36,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -149,7 +150,7 @@ def run(
         ```
     """
     source = str(source)
-    save_img = not nosave and not source.endswith(".txt")  # save inference images
+    save_img = not nosave
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
     webcam = source.isnumeric() or source.endswith(".streams") or (is_url and not is_file)
@@ -180,8 +181,23 @@ def run(
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
-    model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
-    seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
+    model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
+    seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
+    # 获取额外维度数量 (与 val.py 逻辑保持一致)
+    num_extra_dims = 0 # Default to 0
+    if hasattr(model, 'pt') and model.pt and hasattr(model, 'model'):
+        pytorch_model = model.model # DetectionModel instance
+        if hasattr(pytorch_model, 'model') and isinstance(pytorch_model.model, nn.Sequential) and len(pytorch_model.model) > 0:
+            final_layer = pytorch_model.model[-1]
+            if hasattr(final_layer, 'num_extra_dims'):
+                num_extra_dims = final_layer.num_extra_dims
+            else:
+                LOGGER.warning("Final layer of the model does not have 'num_extra_dims' attribute. Using default 0.")
+        else:
+             LOGGER.warning("Could not access the internal sequential model or final layer. Using default 0 for num_extra_dims.")
+    else:
+         LOGGER.warning("Model is not a standard PyTorch model loaded via DetectMultiBackend or structure is unexpected. Using default 0 for num_extra_dims.")
+
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -207,7 +223,15 @@ def run(
                 pred = model(im, augment=augment, visualize=visualize)
         # NMS
         with dt[2]:
-            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+            pred = non_max_suppression(
+                pred, 
+                conf_thres, 
+                iou_thres, 
+                classes, 
+                agnostic_nms, 
+                max_det=max_det,
+                num_extra_dims=num_extra_dims
+            )
 
         # Second-stage classifier (optional)
         # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
@@ -241,7 +265,6 @@ def run(
             s += "{:g}x{:g} ".format(*im.shape[2:])  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
-            annotator = Annotator(im0, line_width=line_thickness, example=str(names))
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -252,35 +275,83 @@ def run(
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Write results
-                for *xyxy, conf, cls in reversed(det):
+                for p_tensor in reversed(det): # Use p_tensor to avoid confusion with path 'p'
+                    xyxy_tensor = p_tensor[:4]
+                    conf = p_tensor[4].item()
+                    cls = p_tensor[5].item()
+                    extra_dims = p_tensor[6:].tolist()
+
                     c = int(cls)  # integer class
-                    label = names[c] if hide_conf else f"{names[c]}"
+                    # label = names[c] if hide_conf else f"{names[c]}" # Original basic label
                     confidence = float(conf)
-                    confidence_str = f"{confidence:.2f}"
+                    # confidence_str = f"{confidence:.2f}" # Not used in final label directly
 
-                    if save_csv:
-                        write_to_csv(p.name, label, confidence_str)
+                    # --- Build the new label string --- 
+                    label_parts = [names[c]]
+                    if not hide_conf:
+                        label_parts.append(f"conf:{confidence:.2f}")
 
-                    if save_txt:  # Write to file
+                    # Process extra dimensions if available
+                    if len(extra_dims) >= 2: # Azimuth (theta) and Pitch (phi)
+                        theta = extra_dims[0]
+                        phi = extra_dims[1]
+                        azimuth_deg = theta * 360 # Denormalize Azimuth
+                        pitch_deg = phi * 180   # Denormalize Pitch
+                        
+                        # Format: Class Prob Azimuth_Value Pitch_Value
+                        label_parts.append(f"Azimuth:{azimuth_deg:.2f}") # Append denormalized Azimuth value
+                        label_parts.append(f"Pitch:{pitch_deg:.2f}")  # Append denormalized Pitch value
+                    
+                    final_label = None if hide_labels else " ".join(label_parts)
+                    # --- End of new label string construction ---
+
+                    # if save_csv:
+                    #     write_to_csv(p.name, label, confidence_str) # Keep original label for CSV for simplicity?
+
+                    if save_txt:
+                        xyxy = xyxy_tensor.tolist() # Convert to list for saving if needed
                         if save_format == 0:
-                            coords = (
-                                (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
-                            )  # normalized xywh
+                             coords = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
                         else:
-                            coords = (torch.tensor(xyxy).view(1, 4) / gn).view(-1).tolist()  # xyxy
-                        line = (cls, *coords, conf) if save_conf else (cls, *coords)  # label format
+                             coords = (torch.tensor(xyxy).view(1, 4) / gn).view(-1).tolist()
+                        line = (cls, *coords, conf) if save_conf else (cls, *coords)
+                        if len(extra_dims) >= 2:
+                            theta, phi = extra_dims[0], extra_dims[1]
+                            line = (*line, theta, phi)
                         with open(f"{txt_path}.txt", "a") as f:
-                            f.write(("%g " * len(line)).rstrip() % line + "\n")
+                             f.write(("%g " * len(line)).rstrip() % line + "\n")
 
                     if save_img or save_crop or view_img:  # Add bbox to image
-                        c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
-                        annotator.box_label(xyxy, label, color=colors(c, True))
+                        # --- OpenCV Drawing Start ---
+                        color = colors(c, True) # BGR color
+                        lw = line_thickness or max(round(sum(im0.shape) / 2 * 0.003), 2) # Line width
+
+                        # Extract integer coordinates
+                        x1, y1, x2, y2 = map(int, xyxy_tensor)
+
+                        # Draw bounding box
+                        cv2.rectangle(im0, (x1, y1), (x2, y2), color, thickness=lw, lineType=cv2.LINE_AA)
+
+                        # Draw label text (if not hidden)
+                        if final_label:
+                            tf = max(lw - 1, 1)  # Font thickness
+                            w, h = cv2.getTextSize(final_label, 0, fontScale=lw / 3, thickness=tf)[0]  # text width, height
+                            outside = y1 - h >= 3
+                            p2 = x1 + w, y1 - h - 3 if outside else y1 + h + 3
+                            cv2.rectangle(im0, (x1, y1), p2, color, -1, cv2.LINE_AA)  # filled text background
+                            cv2.putText(im0,
+                                        final_label, (x1, y1 - 2 if outside else y1 + h + 2),
+                                        0,
+                                        lw / 3,
+                                        (255, 255, 255), # White text
+                                        thickness=tf,
+                                        lineType=cv2.LINE_AA)
+                        # --- OpenCV Drawing End ---
+
                     if save_crop:
-                        save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
+                        save_one_box(xyxy_tensor, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
 
             # Stream results
-            im0 = annotator.result()
             if view_img:
                 if platform.system() == "Linux" and p not in windows:
                     windows.append(p)
@@ -367,8 +438,8 @@ def parse_opt():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5s.pt", help="model path or triton URL")
-    parser.add_argument("--source", type=str, default=ROOT / "data/images", help="file/dir/URL/glob/screen/0(webcam)")
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="(optional) dataset.yaml path")
+    parser.add_argument("--source", type=str, default=ROOT / "data/mydata/drone_dataset_v3/test.txt", help="file/dir/URL/glob/screen/0(webcam)")
+    parser.add_argument("--data", type=str, default=ROOT / "data/mydata.yaml", help="(optional) dataset.yaml path")
     parser.add_argument("--imgsz", "--img", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w")
     parser.add_argument("--conf-thres", type=float, default=0.25, help="confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=0.45, help="NMS IoU threshold")

@@ -88,24 +88,15 @@ class Loggers:
         self.logger = logger  # for printing results to console
         self.include = include
         self.keys = [
-            "train/box_loss",
-            "train/obj_loss",
-            "train/cls_loss",  # train loss
-            "metrics/precision",
-            "metrics/recall",
-            "metrics/mAP_0.5",
-            "metrics/mAP_0.5:0.95",  # metrics
-            "val/box_loss",
-            "val/obj_loss",
-            "val/cls_loss",  # val loss
-            "x/lr0",
-            "x/lr1",
-            "x/lr2",
-        ]  # params
-        self.best_keys = ["best/epoch", "best/precision", "best/recall", "best/mAP_0.5", "best/mAP_0.5:0.95"]
+            'epoch',
+            'train/box_loss', 'train/obj_loss', 'train/cls_loss', 'train/ext_loss', # train loss with ext
+            'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',  # metrics
+            'val/box_loss', 'val/obj_loss', 'val/cls_loss', 'val/ext_loss', # val loss with ext
+            'x/lr0', 'x/lr1', 'x/lr2']  # params
+        self.best_keys = ['best/epoch', 'best/precision', 'best/recall', 'best/mAP_0.5', 'best/mAP_0.5:0.95']
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary
-        self.csv = True  # always log to csv
+        self.csv = True  # always log results to csv file
         self.ndjson_console = "ndjson_console" in self.include  # log ndjson to console
         self.ndjson_file = "ndjson_file" in self.include  # log ndjson to file
 
@@ -251,13 +242,18 @@ class Loggers:
 
     def on_fit_epoch_end(self, vals, epoch, best_fitness, fi):
         """Callback that logs metrics and saves them to CSV or NDJSON at the end of each fit (train+val) epoch."""
-        x = dict(zip(self.keys, vals))
         if self.csv:
             file = self.save_dir / "results.csv"
-            n = len(x) + 1  # number of cols
-            s = "" if file.exists() else (("%20s," * n % tuple(["epoch"] + self.keys)).rstrip(",") + "\n")  # add header
+            n = len(self.keys)  # Use length of keys directly for column count
+            s = "" if file.exists() else (("%20s," * n % tuple(self.keys)).rstrip(",") + "\n")  # Use self.keys for header
             with open(file, "a") as f:
-                f.write(s + ("%20.5g," * n % tuple([epoch] + vals)).rstrip(",") + "\n")
+                # Ensure the number of format specifiers matches the number of data points (epoch + vals)
+                f.write(s + ("%20.5g," * (len(vals) + 1) % tuple([epoch] + vals)).rstrip(",") + "\n")
+        
+        # Create a dictionary using keys *excluding* epoch for other loggers
+        # Assuming the order in self.keys (after epoch) matches the order in vals
+        x = dict(zip(self.keys[1:], vals))
+
         if self.ndjson_console or self.ndjson_file:
             json_data = json.dumps(dict(epoch=epoch, **x), default=_json_default)
         if self.ndjson_console:
@@ -334,7 +330,9 @@ class Loggers:
             )
 
         if self.comet_logger:
-            final_results = dict(zip(self.keys[3:10], results))
+            # Ensure correct keys are zipped with results (P, R, mAP50, mAP95, val_box, val_obj, val_cls, val_ext)
+            # Corresponding keys are at indices 4 through 11
+            final_results = dict(zip(self.keys[4:12], results))
             self.comet_logger.on_train_end(files, self.save_dir, last, best, epoch, final_results)
 
     def on_params_update(self, params: dict):
