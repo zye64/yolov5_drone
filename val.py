@@ -517,7 +517,8 @@ def run(
             if num_extra_dims == 0:
                  LOGGER.warning(f"Using num_extra_dims = 0 for Non-Max Suppression. Angle calculations will likely fail or be skipped.")
             else:
-                 LOGGER.info(f"Using num_extra_dims = {num_extra_dims} for Non-Max Suppression.")
+                #  LOGGER.info(f"Using num_extra_dims = {num_extra_dims} for Non-Max Suppression.")
+                pass
             # --- End Determine num_extra_dims ---
 
             preds = non_max_suppression(
